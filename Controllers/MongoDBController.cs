@@ -157,8 +157,23 @@ namespace ApiCSharp.Controllers
             // Buscamos las tareas que pertenecen al usuario autenticado
             var tasks = collection.Find(x => x["EmailOwner"] == emailOwner).ToList();
 
-            // Deserializamos los documentos BSON a objetos TasksModel
-            var result = tasks.Select(doc => BsonSerializer.Deserialize<TasksModel>(doc)).ToList();
+            // // Deserializamos los documentos BSON a objetos TasksModel
+            // var result = tasks.Select(doc => BsonSerializer.Deserialize<TasksModel>(doc)).ToList();
+
+            // return Ok(result);
+            //
+            // Recordar updetear para que salga
+            var result = tasks.Select(doc => new
+            {
+                Id = doc["_id"].ToString(), // Convertimos ObjectId a string
+                DescriptionTask = doc["DescriptionTask"].AsString,
+                NameTask = doc["NameTask"].AsString,
+                DeadLine = doc["DeadLine"].ToUniversalTime(),
+                Status = doc["Status"].AsString,
+                Category = doc["Category"].AsString,
+
+                EmailOwner = doc["EmailOwner"].AsString
+            }).ToList();
 
             return Ok(result);
         }
@@ -167,7 +182,7 @@ namespace ApiCSharp.Controllers
         [Authorize] // Solo usuarios autenticados pueden actualizar sus tareas
         public IActionResult UpdateTask(string id, [FromBody] TasksModel updatedTask)
         {
-            var emailOwner = User.Identity.Name; // Usamos el email del usuario autenticado
+            var emailOwner = User.Claims.FirstOrDefault(c => c.Type == ClaimTypes.Email)?.Value; // Usamos el email del usuario autenticado
 
             var collection = _mongoDBService.GetCollection("tasks");
 
@@ -212,6 +227,137 @@ namespace ApiCSharp.Controllers
             return Ok("Tarea eliminada exitosamente.");
         }
         #endregion
+
+        [HttpGet("getTasksByGroupId/{id}")]
+        // [Authorize] // Solo usuarios autenticados pueden acceder
+        public IActionResult GetTasksByGroup(string id)
+        {
+            var collection = _mongoDBService.GetCollection("tasks");
+
+            // Buscamos las tareas que pertenecen al grupo con el id proporcionado
+            var tasks = collection.Find(x => x["TaskGroup"] == id).ToList();
+
+            // Si no encontramos tareas, retornamos un NotFound
+            if (tasks == null || !tasks.Any())
+                return NotFound("No se encontraron tareas para este grupo.");
+
+            // Deserializamos los documentos BSON a un formato anónimo
+            var result = tasks.Select(doc => new
+            {
+                Id = doc["_id"].ToString(), // Convertimos ObjectId a string
+                DescriptionTask = doc["DescriptionTask"].AsString,
+                NameTask = doc["NameTask"].AsString,
+                TaskGroup = doc["TaskGroup"].AsString,
+                DeadLine = doc["DeadLine"].ToUniversalTime(),
+                Status = doc["Status"].AsString,
+                Category = doc["Category"].AsString,
+                EmailOwner = doc["EmailOwner"].AsString
+            }).ToList();
+
+            return Ok(result);
+        }
+
+        [HttpPost("createTaskGroup/")]
+        public IActionResult CreateTaskGroup([FromBody] TasksModel taskModel, string groupId)
+        {
+            var emailOwner = User.Claims.FirstOrDefault(c => c.Type == ClaimTypes.Email)?.Value; // Obtener el email del usuario autenticado
+
+            // Verificar si el grupo existe
+            var groupsCollection = _mongoDBService.GetCollection("groups");
+            var group = groupsCollection.Find(g => g["Identifier"].ToString() == groupId).FirstOrDefault();
+
+            if (group == null)
+            {
+                return NotFound("Grupo no encontrado.");
+            }
+
+            // Verificar si el usuario autenticado es el propietario del grupo
+            var groupOwner = group.Contains("OwnerGroup") ? group["OwnerGroup"].AsString : string.Empty;
+            if (groupOwner != emailOwner)
+            {
+                return Unauthorized("Solo el propietario del grupo puede asignar tareas.");
+            }
+
+            // Si todo es correcto, asignamos los valores y creamos la tarea
+            taskModel.EmailOwner = taskModel.EmailOwner; // Email del propietario (usuario autenticado)
+            taskModel.TaskGroup = groupId;    // Id del grupo
+
+            // Crear el documento BSON para la tarea
+            var taskDocument = new BsonDocument
+            {
+                { "DescriptionTask", taskModel.DescriptionTask },
+                { "NameTask", taskModel.NameTask },
+                { "TaskGroup", taskModel.TaskGroup },
+                { "DeadLine", taskModel.DeadLine },
+                { "Status", taskModel.Status },
+                { "Category", taskModel.Category },
+                { "EmailOwner", taskModel.EmailOwner } // Email del propietario
+            };
+
+            var collection = _mongoDBService.GetCollection("tasks");
+
+            // Insertamos la tarea en la colección
+            collection.InsertOne(taskDocument);
+
+            return Ok("Tarea creada exitosamente.");
+        }
+
+        [HttpPost("updateTaskGroup/{taskId}")]
+        [Authorize] // Solo usuarios autenticados pueden actualizar las tareas
+        public IActionResult UpdateTaskGroup(string taskId, [FromBody] TasksModel updatedTask)
+        {
+            var tasksCollection = _mongoDBService.GetCollection("tasks");
+            var groupsCollection = _mongoDBService.GetCollection("groups");
+
+            // Primero, buscamos la tarea por su ID
+            var task = tasksCollection.Find(x => x["_id"] == new ObjectId(taskId)).FirstOrDefault();
+
+            // Si no encontramos la tarea, retornamos NotFound
+            if (task == null)
+                return NotFound("Tarea no encontrada.");
+
+            // Obtenemos el email del propietario de la tarea desde el documento de la tarea
+            var taskOwnerEmail = task["EmailOwner"].AsString;
+
+            // Obtenemos el grupo asociado a la tarea
+            var taskGroupId = task["TaskGroup"]?.AsString;
+
+            // Obtenemos el email del usuario autenticado (propietario de la sesión)
+            var emailOwner = User.Claims.FirstOrDefault(c => c.Type == ClaimTypes.Email)?.Value;
+
+            // Verificamos si el usuario autenticado es el propietario de la tarea o el propietario del grupo
+            if (taskOwnerEmail != emailOwner)
+            {
+                // Si el usuario no es el propietario de la tarea, validamos si es el dueño del grupo
+                var group = groupsCollection.Find(g => g["Identifier"].AsString == taskGroupId).FirstOrDefault();
+                if (group == null || group["OwnerGroup"].AsString != emailOwner)
+                {
+                    // Si el usuario no es el propietario de la tarea ni del grupo, regresamos un Unauthorized
+                    return Unauthorized("No tienes permisos para actualizar esta tarea.");
+                }
+            }
+
+            // Actualizamos los campos de la tarea con los nuevos valores
+            var updateDefinition = Builders<BsonDocument>.Update
+                .Set("DescriptionTask", updatedTask.DescriptionTask)
+                .Set("NameTask", updatedTask.NameTask)
+                .Set("DeadLine", updatedTask.DeadLine)
+                .Set("Status", updatedTask.Status)
+                .Set("EmailOwner", updatedTask.EmailOwner)
+                .Set("Category", updatedTask.Category);
+
+            // Realizamos la actualización en la base de datos
+            var result = tasksCollection.UpdateOne(
+                x => x["_id"] == new ObjectId(taskId),
+                updateDefinition
+            );
+
+            // Si no se actualizó ningún documento, significa que la tarea no existía o algo salió mal
+            if (result.ModifiedCount == 0)
+                return BadRequest("No se pudo actualizar la tarea.");
+
+            return Ok("Tarea actualizada correctamente.");
+        }
 
     }
 }
